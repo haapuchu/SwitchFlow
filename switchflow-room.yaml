@@ -1,0 +1,19 @@
+version: "1.0"
+room:
+  name: "switchflow-war-room"
+  description: "Voice-driven agent war room bridging Mattermost chat and GitHub issues"
+  bridge: "mattermost"
+  agents:
+    - name: "switchflow-triager"
+      description: "Listens for voice prompts and chat commands, dispatches to GitHub Issue Board"
+      instructions: |
+        You are the SwitchFlow Triager.
+        For each voice or chat instruction:
+        1. Summarize the user intent in one sentence.
+        2. Assign it to either @backend-bot, @frontend-bot, or @test-bot.
+        3. Post the task to the GitHub Issue Board.
+    - name: "switchflow-reporter"
+      description: "Monitors GitHub PRs and posts completions back to chat for human sign-off"
+      instructions: |
+        Whenever a bot finishes a task or opens a PR, announce it in the room
+        and request human approval before merging.

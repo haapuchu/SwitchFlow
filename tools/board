@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# SwitchFlow Agent Message Board CLI
+# Wraps GitHub CLI (gh) for rate-limited, incremental board coordination.
+set -u
+
+ISSUE="${BOARD_ISSUE:-1}"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+STATE_DIR="$ROOT/.board_state"
+
+die() { echo "board: $*" >&2; exit 1; }
+command -v gh >/dev/null 2>&1 || die "gh CLI not found. Run: gh auth login"
+
+valid_repo() { [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; }
+valid_login() { [[ "$1" =~ ^[A-Za-z0-9-]+$ ]]; }
+
+repo_from_remote() {
+  local url path
+  url="$(git remote get-url origin 2>/dev/null)" || return 1
+  case "$url" in
+    https://*|http://*|ssh://*) path="${url#*://}"; path="${path#*/}" ;;
+    git@*:* ) path="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  path="${path%.git}"
+  path="${path%/}"
+  valid_repo "$path" || return 1
+  printf '%s\n' "$path"
+}
+
+repo() {
+  if [ -n "${BOARD_REPO:-}" ]; then
+    valid_repo "$BOARD_REPO" || return 1
+    printf '%s\n' "$BOARD_REPO"
+    return 0
+  fi
+  local r
+  r="$(repo_from_remote 2>/dev/null)" || r=""
+  if [ -z "$r" ]; then
+    r="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || r=""
+  fi
+  valid_repo "$r" || return 1
+  printf '%s\n' "$r"
+}
+
+REPO="$(repo 2>/dev/null || true)"
+[ -n "$REPO" ] || die "Cannot determine repository. Set BOARD_REPO=owner/repo"
+
+me() {
+  local l
+  l="$(gh api user --jq .login 2>/dev/null)" || return 1
+  valid_login "$l" && echo "$l"
+}
+
+b64d() { base64 -d 2>/dev/null || base64 -D; }
+
+JQ_ROW='.[] | "\(.id)\t\(.user.login)\t\(.created_at)\t\(.body | @base64)"'
+
+fetch_since() {
+  gh api --paginate "repos/$REPO/issues/$ISSUE/comments?per_page=100&since=$1" --jq "$JQ_ROW" 2>/dev/null
+}
+
+fetch_last() {
+  local want="$1" count page out have=0 acc=""
+  count="$(gh api "repos/$REPO/issues/$ISSUE" --jq .comments 2>/dev/null)" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] || return 0
+  page=$(( (count + 99) / 100 ))
+  while [ "$page" -ge 1 ] && [ "$have" -lt "$want" ]; do
+    out="$(gh api "repos/$REPO/issues/$ISSUE/comments?per_page=100&page=$page" --jq "$JQ_ROW" 2>/dev/null)" || return 1
+    [ -n "$out" ] && { acc="$out"$'\n'"$acc"; have=$(( have + $(printf '%s\n' "$out" | wc -l) )); }
+    page=$(( page - 1 ))
+  done
+  printf '%s\n' "$acc" | awk 'NF' | tail -n "$want"
+}
+
+cursor_file() { echo "$STATE_DIR/cursor_bash_${ISSUE}.txt"; }
+get_cursor() { local f; f="$(cursor_file)"; [ -s "$f" ] && cat "$f" || echo ""; }
+set_cursor() {
+  mkdir -p "$STATE_DIR"
+  local cur; cur="$(get_cursor | cut -d' ' -f1)"
+  if [ -z "$cur" ] || [ "$1" -gt "$cur" ]; then echo "$1 $2" > "$(cursor_file)"; fi
+}
+
+render() {
+  local login="$1" id user ts b body flag
+  while IFS=$'\t' read -r id user ts b; do
+    [ -n "$id" ] || continue
+    body="$(printf '%s' "$b" | b64d | tr -d '\r')"
+    flag=""
+    if [ -n "$login" ] && printf '%s' "$body" | grep -qiE "(^|[^A-Za-z0-9_-])@(${login}|all)([^A-Za-z0-9_-]|$)"; then
+      flag=" [MENTION]"
+    fi
+    printf -- '--- @%s %s (#%s)%s\n%s\n' "$user" "$ts" "$id" "$flag" "$body"
+  done
+}
+
+do_unread() {
+  local all login cur cid cts new maxrow
+  login="$(me)" || return 1
+  cur="$(get_cursor)"; cid="${cur%% *}"; cts="${cur#* }"
+  if [ -z "$cur" ] || [ "$cid" = "$cts" ]; then
+    all="$(fetch_last 10)" || return 1
+    new="$all"
+  else
+    all="$(fetch_since "$cts")" || return 1
+    new="$(printf '%s\n' "$all" | awk -F'\t' -v c="$cid" 'NF && $1+0 > c+0')"
+  fi
+  [ -n "$new" ] || return 0
+  maxrow="$(printf '%s\n' "$new" | sort -n -t"$(printf '\t')" -k1,1 | tail -1)"
+  new="$(printf '%s\n' "$new" | awk -F'\t' -v me="$login" 'NF && tolower($2) != tolower(me)')"
+  if [ -n "$new" ]; then
+    printf '%s\n' "$new" | render "$login"
+  fi
+  set_cursor "$(printf '%s' "$maxrow" | cut -f1)" "$(printf '%s' "$maxrow" | cut -f3)"
+  return 0
+}
+
+cmd_post() {
+  local text
+  if [ $# -gt 0 ]; then text="$*"; else text="$(cat)"; fi
+  [ -n "$text" ] || die "Empty post"
+  case "$text" in
+    "["*"'s "*"]"*) ;;
+    *) die "Post must start with [<Human>'s <Agent>], for example: [Developer's BackendBot]" ;;
+  esac
+  gh api "repos/$REPO/issues/$ISSUE/comments" -f body="$text" --jq .html_url || die "Post failed"
+}
+
+cmd_read() {
+  local n="${1:-10}"
+  local all login
+  all="$(fetch_last "$n")" || die "Could not fetch comments"
+  login="$(me)" || login=""
+  [ -n "$all" ] && printf '%s\n' "$all" | tail -n "$n" | render "$login"
+}
+
+case "${1:-help}" in
+  post) shift; cmd_post "$@" ;;
+  read) shift; cmd_read "${1:-10}" ;;
+  unread) do_unread || die "Could not fetch unread comments" ;;
+  whoami) me || die "gh not authenticated" ;;
+  *)
+    cat <<USAGE
+SwitchFlow Board Tool
+Usage:
+  tools/board post "<text>"    Post a comment starting with [<Human>'s <Agent>]
+  tools/board read [N]         Show the last N comments (default 10)
+  tools/board unread           Show unread comments since last check
+  tools/board whoami           Print your GitHub login handle
+USAGE
+    ;;
+esac
