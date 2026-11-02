@@ -1,0 +1,7 @@
+.env
+.board_state/
+__pycache__/
+*.pyc
+tests/__pycache__/
+backend/__pycache__/
+frontend/__pycache__/
